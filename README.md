@@ -10,33 +10,14 @@ pip install --extra-index-url https://download.pytorch.org/whl/cpu torch torchvi
 ```
 
 ## Descripción General
-Este repositorio contiene una implementación en Python para la detección y seguimiento de personas utilizando modelos YOLOv8 y ByteTrack. El script proporciona detección y seguimiento eficiente de personas tanto en archivos de video como en cámaras, con características de optimización de rendimiento.
+Implementación para detectar y seguir personas con YOLOv8 y ByteTrack en videos o cámaras.
 
 ## Funcionalidades
 
-### Características de Detección
-- Detección de personas utilizando modelos YOLOv8
-- Filtrado de detecciones basado en confianza
-- Cambio automático a modo de solo detección cuando el seguimiento falla
-- Soporte para múltiples clases de objetos (predeterminado: persona)
-
-### Características de Seguimiento
-- Seguimiento de objetos con el algoritmo ByteTrack
-- IDs de seguimiento persistentes para las personas detectadas
-- Implementación de seguimiento no bloqueante con manejo de tiempos de espera
-- Recuperación automática de fallos de seguimiento
-
-### Optimización de Rendimiento
-- Redimensionamiento automático de fotogramas para videos de alta resolución
-- Limitación de FPS para cámaras
-- Control de resolución para reducir la carga computacional
-- Seguimiento basado en hilos para evitar congelamiento de la interfaz
-
-### Características de Visualización
-- Visualización de cuadros delimitadores para personas detectadas
-- Visualización de IDs de seguimiento con código de colores para cada persona
-- Contador de FPS en tiempo real e información de resolución
-- Indicador de modo (Seguimiento/Detección)
+- **Detección**: Modelos YOLOv8, filtrado por confianza, soporte multi-clase
+- **Seguimiento**: ByteTrack con IDs persistentes y recuperación automática
+- **Optimización**: Redimensionamiento automático, limitación de FPS
+- **Visualización**: Cuadros delimitadores con IDs, contador de FPS en tiempo real
 
 ## Uso
 
