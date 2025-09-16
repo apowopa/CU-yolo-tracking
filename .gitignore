@@ -1,6 +1,10 @@
 # Video formats, prevent save data in the repo
 *.mp4 
 
+# archivos del modelo de yolo
+
+*.pt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
