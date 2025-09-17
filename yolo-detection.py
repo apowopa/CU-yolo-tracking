@@ -5,6 +5,15 @@ import sys
 import time
 import threading
 from ultralytics import YOLO
+from collections import defaultdict
+
+
+def sign_of_line(A, B, P):
+    """Determina de qué lado de una línea se encuentra un punto.
+       1 si P está por encima/izquierda, -1 si está por debajo/derecha, 0 si está en la línea
+    """
+    return np.sign((B[0] - A[0]) * (P[1] - A[1]) - (B[1] - A[1]) * (P[0] - A[0]))
+
 
 def try_open_capture(device, width=640, height=480, fps=15, prefer_mjpg=True, use_v4l2=True):
     """Abre una fuente de video (cámara o archivo) y configura su resolución y FPS.
@@ -120,6 +129,8 @@ def main():
     ap.add_argument("--width", type=int, default=640, help="Ancho máximo de procesamiento")
     ap.add_argument("--height", type=int, default=480, help="Alto máximo de procesamiento")
     ap.add_argument("--fps", type=int, default=15, help="FPS máximo para captura de cámara")
+    ap.add_argument("--target-fps", type=int, default=0, help="FPS objetivo para videos (0=velocidad máxima)")
+    ap.add_argument("--frame-skip", type=int, default=0, help="Saltar N frames por cada frame procesado (0=desactivado)")
     ap.add_argument("--tracker", type=str, default="bytetrack.yaml", help="Tipo de tracker (bytetrack.yaml, botsort.yaml)")
     args = ap.parse_args()
 
@@ -156,11 +167,66 @@ def main():
     
     # Variable para controlar si estamos usando tracking o detección simple
     using_tracking = True
+    
+    # Variables para el conteo de personas
+    count_in = 0
+    count_out = 0
+    
+    # Inicializar la línea de conteo (por defecto en la mitad horizontal)
+    line_start = (0, eff_h // 2)
+    line_end = (eff_w, eff_h // 2)
+    
+    # Estado para definir la línea de conteo mediante clics
+    define_line = False
+    line_points = []
+    
+    # Diccionario para almacenar información de los tracks
+    tracks_info = {}
+    
+    # Función para manejar eventos de clic del mouse
+    def mouse_callback(event, x, y, flags, param):
+        nonlocal define_line, line_points, line_start, line_end
+        
+        if define_line and event == cv2.EVENT_LBUTTONDOWN:
+            line_points.append((x, y))
+            if len(line_points) == 2:
+                line_start = line_points[0]
+                line_end = line_points[1]
+                define_line = False
+                line_points = []
+                print(f"Nueva línea de conteo definida: {line_start} a {line_end}")
+    
+    # Registrar la función de callback
+    cv2.setMouseCallback(win, mouse_callback)
+    
+    # Determinar si estamos usando una cámara o un archivo de video
+    is_camera = isinstance(source_input, int) or (isinstance(source_input, str) and source_input.isdigit())
+    
+    # Configuración para el control de framerate
+    frame_time = 0  # Tiempo que debería tomar procesar un frame
+    if not is_camera and args.target_fps > 0:
+        frame_time = 1.0 / args.target_fps
+    
+    # Configurar el salto de frames para videos
+    frame_skip = max(0, args.frame_skip)
+    frame_count = 0
+    process_start = time.time()  # Inicializar para evitar errores
 
     while True:
+        # Control de framerate para videos
+        if not is_camera and args.target_fps > 0:
+            process_start = time.time()
+            
+        # Leer el frame actual
         ret, frame = cap.read()
         if not ret:
             break
+            
+        # Saltar frames si es necesario (solo para videos)
+        if not is_camera and frame_skip > 0:
+            frame_count += 1
+            if frame_count % (frame_skip + 1) != 0:
+                continue
         
         # Crear una copia del frame para dibujar
         vis_frame = frame.copy()
@@ -230,6 +296,29 @@ def main():
         cv2.putText(vis_frame, f"FPS: {fps_display:.1f} | Res: {eff_w}x{eff_h} | Modo: {mode_text}", 
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
+        # Mostrar información de control de frames si no es cámara
+        if not is_camera:
+            frame_ctrl_text = f"Skip: {frame_skip}"
+            if args.target_fps > 0:
+                frame_ctrl_text += f" | Target FPS: {args.target_fps}"
+            cv2.putText(vis_frame, frame_ctrl_text, 
+                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        # Dibujar la línea de conteo
+        cv2.line(vis_frame, line_start, line_end, (0, 0, 255), 2)
+        
+        # Mostrar instrucciones sobre cómo definir la línea
+        if define_line:
+            cv2.putText(vis_frame, "Definiendo linea: haz clic para punto 1, luego punto 2", 
+                       (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            # Si ya tenemos un punto, dibujarlo
+            if len(line_points) == 1:
+                cv2.circle(vis_frame, line_points[0], 5, (0, 0, 255), -1)
+        
+        # Mostrar contadores
+        cv2.putText(vis_frame, f"IN: {count_in} | OUT: {count_out} | TOTAL: {count_in + count_out}", 
+                   (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+        
         # Obtener los resultados del tracking            
         if results[0].boxes is not None:
             # Convertir tensores a numpy arrays
@@ -259,6 +348,10 @@ def main():
                     x1, y1, x2, y2 = box
                     conf = confs[i]
                     
+                    # Calcular el centro de la persona para verificar el cruce de línea
+                    center_x = (x1 + x2) // 2
+                    center_y = (y1 + y2) // 2
+                    
                     # Determinar color y etiqueta según si tenemos track_id
                     if has_track_ids and track_ids is not None:
                         track_id = track_ids[i]
@@ -266,6 +359,40 @@ def main():
                         color_id = int((track_id * 50) % 255)
                         color = (int(color_id), int(255 - color_id), 150)
                         label = f"ID:{track_id} {conf:.2f}"
+                        
+                        # Verificar en qué lado de la línea está la persona
+                        current_side = sign_of_line(line_start, line_end, (center_x, center_y))
+                        
+                        # Actualizar la información del track
+                        if track_id not in tracks_info:
+                            tracks_info[track_id] = {
+                                'prev_side': current_side,
+                                'last_side': current_side,
+                                'age': 1,
+                                'counted_in': False,
+                                'counted_out': False
+                            }
+                        else:
+                            # Actualizar información
+                            info = tracks_info[track_id]
+                            info['prev_side'] = info['last_side']
+                            info['last_side'] = current_side
+                            info['age'] += 1
+                            
+                            # Verificar si ha cruzado la línea (con histéresis)
+                            if info['age'] >= 3 and info['prev_side'] != info['last_side']:
+                                if info['last_side'] > 0 and not info['counted_in']:
+                                    count_in += 1
+                                    info['counted_in'] = True
+                                    print(f"Persona ID:{track_id} entró. Total IN: {count_in}")
+                                elif info['last_side'] < 0 and not info['counted_out']:
+                                    count_out += 1
+                                    info['counted_out'] = True
+                                    print(f"Persona ID:{track_id} salió. Total OUT: {count_out}")
+                        
+                        # Dibujar punto en el centro con color según el lado
+                        center_color = (0, 255, 0) if current_side > 0 else (0, 0, 255)
+                        cv2.circle(vis_frame, (center_x, center_y), 4, center_color, -1)
                     else:
                         # Color por defecto para detecciones sin ID
                         color = (0, 255, 0)
@@ -283,9 +410,30 @@ def main():
                     print(f"Error procesando detección {i}: {e}")
 
         cv2.imshow(win, vis_frame)
+        
+        # Control de framerate para videos
+        if not is_camera and args.target_fps > 0:
+            process_time = time.time() - process_start
+            sleep_time = max(0, frame_time - process_time)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+        
         key = cv2.waitKey(1) & 0xFF
         if key == 27 or key == ord('q'):
             break
+        elif key == ord('l'):
+            # Activar modo de definición de línea
+            define_line = True
+            line_points = []
+            print("Modo de definición de línea activado. Haz dos clics para definir la línea.")
+        elif key == ord('+') and not is_camera and frame_skip < 10:
+            # Aumentar el salto de frames
+            frame_skip += 1
+            print(f"Salto de frames: {frame_skip}")
+        elif key == ord('-') and not is_camera and frame_skip > 0:
+            # Disminuir el salto de frames
+            frame_skip -= 1
+            print(f"Salto de frames: {frame_skip}")
 
     cap.release()
     cv2.destroyAllWindows()
