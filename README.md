@@ -1,7 +1,6 @@
 # Detección y Seguimiento de Personas con YOLO
 
-## RECOMENDACIONES DE INSTALACIÓN DE ULTRALYTICS
-
+### RECOMENDACIONES DE INSTALACION DE ULTRALYTICS
 Si tu computadora no tiene una GPU compatible con CUDA, utiliza el siguiente comando para instalar ultralytics:
 
 ```bash
