@@ -138,7 +138,7 @@ def main():
     ap.add_argument("--draw-boxes", action="store_true", default=True, help="Dibujar bounding boxes (desactivar para ahorrar recursos)")
     ap.add_argument("--ground-truth", type=str, default="", help="Ruta al archivo CSV con ground truth de conteos [time,in,out]")
     ap.add_argument("--save-events", type=str, default="", help="Guardar eventos de cruce en archivo CSV [frame,track_id,event,count]")
-    ap.add_argument("--output-video", type=str, default="", help="Guardar video con UI en archivo de salida (ej: output.mp4)")
+    ap.add_argument("--output-video", type=str, default="", help="Guardar video con UI en archivo de salida MP4 (ej: output.mp4)")
     args = ap.parse_args()
 
     print(f"Cargando modelo {args.model}...")
@@ -205,8 +205,16 @@ def main():
     
     # Inicializar VideoWriter si se especificó archivo de salida
     video_writer = None
+    output_filename = ""  # Variable para guardar el nombre del archivo de salida
+    
     if args.output_video:
         try:
+            # Asegurar que la extensión del archivo sea .mp4
+            output_filename = args.output_video
+            if not output_filename.lower().endswith('.mp4'):
+                output_filename += '.mp4'
+                print(f"Añadiendo extensión .mp4 al archivo de salida: {output_filename}")
+            
             # Definir codec de video
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec MP4
             
@@ -223,12 +231,12 @@ def main():
                 
             # Crear el VideoWriter (nombre archivo, codec, fps, resolución)
             video_writer = cv2.VideoWriter(
-                args.output_video, 
+                output_filename, 
                 fourcc, 
                 output_fps,  # Usar los FPS determinados
                 (eff_w, eff_h)  # Misma resolución que el video original
             )
-            print(f"Se guardará el video con UI en: {args.output_video}")
+            print(f"Se guardará el video con UI en: {output_filename}")
         except Exception as e:
             print(f"Error al inicializar VideoWriter: {e}")
             video_writer = None
@@ -664,7 +672,7 @@ def main():
     # Liberar VideoWriter si está inicializado
     if video_writer is not None:
         video_writer.release()
-        print(f"Video con UI guardado en: {args.output_video}")
+        print(f"Video con UI guardado en: {output_filename}")
     
     if not args.headless:
         cv2.destroyAllWindows()
