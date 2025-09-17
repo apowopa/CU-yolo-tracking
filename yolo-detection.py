@@ -3,9 +3,8 @@ import cv2
 import numpy as np
 import sys
 import time
-import threading
+import torch
 from ultralytics import YOLO
-from collections import defaultdict
 
 
 def sign_of_line(A, B, P):
@@ -44,7 +43,7 @@ def try_open_capture(device, width=640, height=480, fps=15, prefer_mjpg=True, us
     # Obtener propiedades originales
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    orig_fps = cap.get(cv2.CAP_PROP_FPS)
+    cap_fps = cap.get(cv2.CAP_PROP_FPS)
     
     if is_camera:
         # Para cámaras, intentar establecer los parámetros directamente
@@ -76,7 +75,7 @@ def try_open_capture(device, width=640, height=480, fps=15, prefer_mjpg=True, us
                     new_w = width
                     new_h = int(new_w / aspect_ratio)
                     
-            print(f"Redimensionando video de {orig_w}x{orig_h} a {new_w}x{new_h}")
+            print(f"Redimensionando video de {orig_w}x{orig_h}@{cap_fps:.1f}fps a {new_w}x{new_h}")
             
             # Crear una clase para manejar el redimensionamiento automático
             class ResizeCapture:
@@ -132,10 +131,25 @@ def main():
     ap.add_argument("--target-fps", type=int, default=0, help="FPS objetivo para videos (0=velocidad máxima)")
     ap.add_argument("--frame-skip", type=int, default=0, help="Saltar N frames por cada frame procesado (0=desactivado)")
     ap.add_argument("--tracker", type=str, default="bytetrack.yaml", help="Tipo de tracker (bytetrack.yaml, botsort.yaml)")
+    ap.add_argument("--half", action="store_true", help="Usar half precision (FP16) para reducir consumo de memoria")
+    ap.add_argument("--headless", action="store_true", help="Modo sin interfaz gráfica (solo salida por consola)")
+    ap.add_argument("--draw-boxes", action="store_true", default=True, help="Dibujar bounding boxes (desactivar para ahorrar recursos)")
     args = ap.parse_args()
 
     print(f"Cargando modelo {args.model}...")
     model = YOLO(args.model)
+    
+    # Aplicar half precision si se solicita
+    device = 'cpu'
+    if torch.cuda.is_available():
+        device = 'cuda'
+        if args.half:
+            print("Usando half precision (FP16) para reducir consumo de memoria")
+            # Half precision solo funciona en GPU
+            model.to(device).half()
+    else:
+        print("CUDA no disponible, usando CPU")
+        model.to(device)
     
     # Verificar si el modelo soporta tracking
     if not hasattr(model, 'track'):
@@ -156,17 +170,16 @@ def main():
     eff_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     eff_fps = cap.get(cv2.CAP_PROP_FPS)
     print(f"Captura iniciada: {eff_w}x{eff_h} @ {eff_fps:.1f}FPS")
+    
+    # Configuración de ventana solo si no estamos en modo headless
     win = "Tracking con YOLOv8"
-    cv2.namedWindow(win)
+    if not args.headless:
+        cv2.namedWindow(win)
     
     # Variable para medir FPS
     last_time = time.time()
     fps_counter = 0
     fps_display = 0
-    tracking_timeout = 0.5  # Timeout en segundos para tracking
-    
-    # Variable para controlar si estamos usando tracking o detección simple
-    using_tracking = True
     
     # Variables para el conteo de personas
     count_in = 0
@@ -196,8 +209,9 @@ def main():
                 line_points = []
                 print(f"Nueva línea de conteo definida: {line_start} a {line_end}")
     
-    # Registrar la función de callback
-    cv2.setMouseCallback(win, mouse_callback)
+    # Registrar la función de callback solo si no estamos en modo headless
+    if not args.headless:
+        cv2.setMouseCallback(win, mouse_callback)
     
     # Determinar si estamos usando una cámara o un archivo de video
     is_camera = isinstance(source_input, int) or (isinstance(source_input, str) and source_input.isdigit())
@@ -212,6 +226,10 @@ def main():
     frame_count = 0
     process_start = time.time()  # Inicializar para evitar errores
 
+    # Contadores de fotogramas perdidos y procesados para estadísticas
+    processed_frames = 0
+    total_frames = 0
+
     while True:
         # Control de framerate para videos
         if not is_camera and args.target_fps > 0:
@@ -222,14 +240,20 @@ def main():
         if not ret:
             break
             
+        total_frames += 1
+            
         # Saltar frames si es necesario (solo para videos)
         if not is_camera and frame_skip > 0:
             frame_count += 1
             if frame_count % (frame_skip + 1) != 0:
                 continue
         
-        # Crear una copia del frame para dibujar
-        vis_frame = frame.copy()
+        processed_frames += 1
+        
+        # Crear una copia del frame para dibujar solo si es necesario
+        vis_frame = None
+        if not args.headless:
+            vis_frame = frame.copy()
         
         # Medir tiempo para FPS
         current_time = time.time()
@@ -242,61 +266,53 @@ def main():
             fps_counter = 0
             last_time = current_time
             
-        if using_tracking:
-            class TrackingThread(threading.Thread):
-                def __init__(self, model, frame, args):
-                    threading.Thread.__init__(self)
-                    self.model = model
-                    self.frame = frame
-                    self.args = args
-                    self.results = None
-                    
-                def run(self):
-                    try:
-                        self.results = self.model.track(
-                            self.frame, 
-                            conf=self.args.conf, 
-                            classes=self.args.classes, 
-                            imgsz=self.args.imgsz, 
-                            tracker=self.args.tracker,
-                            persist=True,
-                            verbose=False
-                        )
-                    except Exception as e:
-                        print(f"Error en tracking: {e}")
-                        self.results = None
-            
-            tracking_thread = TrackingThread(model, frame, args)
-            tracking_thread.start()
-            tracking_thread.join(timeout=tracking_timeout)
-            
-            # Si el hilo sigue vivo después del timeout, matarlo y usar predict
-            if tracking_thread.is_alive():
-                print("Tracking timeout - cambiando a predict")
-                using_tracking = False
-                results = model.predict(frame, conf=args.conf, classes=args.classes, imgsz=args.imgsz, verbose=False)
-            else:
-                # Si el tracking funcionó, usar los resultados
-                if tracking_thread.results is not None:
-                    results = tracking_thread.results
-                else:
-                    # Si hubo un error en el tracking, usar predict
-                    print("Error en tracking - cambiando a predict")
-                    using_tracking = False
-                    results = model.predict(frame, conf=args.conf, classes=args.classes, imgsz=args.imgsz, verbose=False)
-        else:
-            # Si estamos en modo predict, intentar volver a tracking cada 30 frames
-            if fps_counter % 30 == 0:
-                using_tracking = True
-                print("Intentando volver a tracking")
-            results = model.predict(frame, conf=args.conf, classes=args.classes, imgsz=args.imgsz, verbose=False)
+        # Ejecutar el tracking directamente sin threading
+        try:
+            # Al usar stream=True, results es un generador que debemos iterar
+            results_generator = model.track(
+                frame, 
+                conf=args.conf, 
+                classes=args.classes, 
+                imgsz=args.imgsz, 
+                tracker=args.tracker,
+                persist=True,
+                verbose=False,
+                stream=True
+            )
+            # Obtener el primer (y único) resultado del generador
+            r = next(results_generator)
+        except Exception as e:
+            print(f"Error en tracking: {e}")
+            continue
         
-        # Mostrar FPS, resolución y modo
-        mode_text = "Tracking" if using_tracking else "Detección"
-        cv2.putText(vis_frame, f"FPS: {fps_display:.1f} | Res: {eff_w}x{eff_h} | Modo: {mode_text}", 
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        
-        # Mostrar información de control de frames si no es cámara
+        # Solo procesamos la visualización si no estamos en modo headless
+        if not args.headless:
+            # Mostrar FPS, resolución y modo
+            cv2.putText(vis_frame, f"FPS: {fps_display:.1f} | Res: {eff_w}x{eff_h} | Proc: {processed_frames}/{total_frames}", 
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            # Mostrar información de control de frames si no es cámara
+            if not is_camera:
+                frame_ctrl_text = f"Skip: {frame_skip}"
+                if args.target_fps > 0:
+                    frame_ctrl_text += f" | Target FPS: {args.target_fps}"
+                cv2.putText(vis_frame, frame_ctrl_text, 
+                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            # Dibujar la línea de conteo
+            cv2.line(vis_frame, line_start, line_end, (0, 0, 255), 2)
+            
+            # Mostrar instrucciones sobre cómo definir la línea
+            if define_line:
+                cv2.putText(vis_frame, "Definiendo linea: haz clic para punto 1, luego punto 2", 
+                           (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                # Si ya tenemos un punto, dibujarlo
+                if len(line_points) == 1:
+                    cv2.circle(vis_frame, line_points[0], 5, (0, 0, 255), -1)
+            
+            # Mostrar contadores
+            cv2.putText(vis_frame, f"IN: {count_in} | OUT: {count_out} | TOTAL: {count_in + count_out}", 
+                       (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
         if not is_camera:
             frame_ctrl_text = f"Skip: {frame_skip}"
             if args.target_fps > 0:
@@ -320,29 +336,29 @@ def main():
                    (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
         
         # Obtener los resultados del tracking            
-        if results[0].boxes is not None:
+        if r.boxes is not None:
             # Convertir tensores a numpy arrays
-            boxes = results[0].boxes.xyxy
+            boxes = r.boxes.xyxy
             if hasattr(boxes, 'cpu'):  # Si es un tensor
                 boxes = boxes.cpu().numpy()
             boxes = boxes.astype(int)
             
-            confs = results[0].boxes.conf
+            confs = r.boxes.conf
             if hasattr(confs, 'cpu'):  # Si es un tensor
                 confs = confs.cpu().numpy()
             
             # Verificar si tenemos track_ids
             has_track_ids = False
             track_ids = None
-            if hasattr(results[0].boxes, 'id') and results[0].boxes.id is not None:
-                track_ids = results[0].boxes.id
+            if hasattr(r.boxes, 'id') and r.boxes.id is not None:
+                track_ids = r.boxes.id
                 if hasattr(track_ids, 'cpu'):
                     track_ids = track_ids.cpu().numpy()
                 if len(track_ids) > 0:
                     track_ids = track_ids.astype(int)
                     has_track_ids = True
             
-            # Dibujar cada detección con su ID
+            # Procesar cada detección
             for i, box in enumerate(boxes):
                 try:
                     x1, y1, x2, y2 = box
@@ -390,26 +406,75 @@ def main():
                                     info['counted_out'] = True
                                     print(f"Persona ID:{track_id} salió. Total OUT: {count_out}")
                         
-                        # Dibujar punto en el centro con color según el lado
-                        center_color = (0, 255, 0) if current_side > 0 else (0, 0, 255)
-                        cv2.circle(vis_frame, (center_x, center_y), 4, center_color, -1)
+                        # Dibujar elementos visuales solo si no estamos en modo headless
+                        if not args.headless:
+                            # Dibujar punto en el centro con color según el lado
+                            center_color = (0, 255, 0) if current_side > 0 else (0, 0, 255)
+                            cv2.circle(vis_frame, (center_x, center_y), 4, center_color, -1)
+                            
+                            # Dibujar bounding box si está habilitado
+                            if args.draw_boxes:
+                                cv2.rectangle(vis_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                                
+                                # Dibujar ID y confianza
+                                cv2.putText(vis_frame, label, (int(x1), int(y1 - 10)), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 4, cv2.LINE_AA)
+                                cv2.putText(vis_frame, label, (int(x1), int(y1 - 10)), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
                     else:
-                        # Color por defecto para detecciones sin ID
-                        color = (0, 255, 0)
-                        label = f"Conf: {conf:.2f}"
-                    
-                    # Dibujar bounding box
-                    cv2.rectangle(vis_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                    
-                    # Dibujar ID y confianza
-                    cv2.putText(vis_frame, label, (int(x1), int(y1 - 10)), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 4, cv2.LINE_AA)
-                    cv2.putText(vis_frame, label, (int(x1), int(y1 - 10)), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+                        # Detecciones sin ID, solo dibujar si no estamos en modo headless
+                        if not args.headless and args.draw_boxes:
+                            # Color por defecto para detecciones sin ID
+                            color = (0, 255, 0)
+                            label = f"Conf: {conf:.2f}"
+                            
+                            # Dibujar bounding box
+                            cv2.rectangle(vis_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                            
+                            # Dibujar confianza
+                            cv2.putText(vis_frame, label, (int(x1), int(y1 - 10)), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 4, cv2.LINE_AA)
+                            cv2.putText(vis_frame, label, (int(x1), int(y1 - 10)), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
                 except Exception as e:
                     print(f"Error procesando detección {i}: {e}")
 
-        cv2.imshow(win, vis_frame)
+        # Visualización solo si no estamos en modo headless
+        if not args.headless:
+            # Mostrar FPS, resolución y estadísticas de procesamiento
+            cv2.putText(vis_frame, f"FPS: {fps_display:.1f} | Res: {eff_w}x{eff_h} | Proc: {processed_frames}/{total_frames}", 
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            # Mostrar información de control de frames si no es cámara
+            if not is_camera:
+                frame_ctrl_text = f"Skip: {frame_skip}"
+                if args.target_fps > 0:
+                    frame_ctrl_text += f" | Target FPS: {args.target_fps}"
+                cv2.putText(vis_frame, frame_ctrl_text, 
+                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            # Dibujar la línea de conteo
+            cv2.line(vis_frame, line_start, line_end, (0, 0, 255), 2)
+            
+            # Mostrar instrucciones sobre cómo definir la línea
+            if define_line:
+                cv2.putText(vis_frame, "Definiendo linea: haz clic para punto 1, luego punto 2", 
+                           (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                # Si ya tenemos un punto, dibujarlo
+                if len(line_points) == 1:
+                    cv2.circle(vis_frame, line_points[0], 5, (0, 0, 255), -1)
+            
+            # Mostrar contadores
+            cv2.putText(vis_frame, f"IN: {count_in} | OUT: {count_out} | TOTAL: {count_in + count_out}", 
+                       (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                       
+            # Mostrar la imagen
+            cv2.imshow(win, vis_frame)
+            
+        # Siempre mostrar contadores en modo headless
+        else:
+            if fps_counter % 30 == 0:  # Actualizar cada 30 frames para no saturar la consola
+                print(f"FPS: {fps_display:.1f} | IN: {count_in} | OUT: {count_out} | TOTAL: {count_in + count_out}")
         
         # Control de framerate para videos
         if not is_camera and args.target_fps > 0:
@@ -418,25 +483,33 @@ def main():
             if sleep_time > 0:
                 time.sleep(sleep_time)
         
-        key = cv2.waitKey(1) & 0xFF
-        if key == 27 or key == ord('q'):
-            break
-        elif key == ord('l'):
-            # Activar modo de definición de línea
-            define_line = True
-            line_points = []
-            print("Modo de definición de línea activado. Haz dos clics para definir la línea.")
-        elif key == ord('+') and not is_camera and frame_skip < 10:
-            # Aumentar el salto de frames
-            frame_skip += 1
-            print(f"Salto de frames: {frame_skip}")
-        elif key == ord('-') and not is_camera and frame_skip > 0:
-            # Disminuir el salto de frames
-            frame_skip -= 1
-            print(f"Salto de frames: {frame_skip}")
+        # Control de teclado solo si no estamos en modo headless
+        if not args.headless:
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27 or key == ord('q'):
+                break
+            elif key == ord('l'):
+                # Activar modo de definición de línea
+                define_line = True
+                line_points = []
+                print("Modo de definición de línea activado. Haz dos clics para definir la línea.")
+            elif key == ord('+') and not is_camera and frame_skip < 10:
+                # Aumentar el salto de frames
+                frame_skip += 1
+                print(f"Salto de frames: {frame_skip}")
+            elif key == ord('-') and not is_camera and frame_skip > 0:
+                # Disminuir el salto de frames
+                frame_skip -= 1
+                print(f"Salto de frames: {frame_skip}")
 
     cap.release()
-    cv2.destroyAllWindows()
+    if not args.headless:
+        cv2.destroyAllWindows()
+        
+    # Mostrar estadísticas finales
+    print("\nEstadísticas finales:")
+    print(f"Frames procesados: {processed_frames}/{total_frames} ({processed_frames/total_frames*100:.1f}%)")
+    print(f"Conteo de personas: IN: {count_in} | OUT: {count_out} | TOTAL: {count_in + count_out}")
 
 if __name__ == "__main__":
     main()
