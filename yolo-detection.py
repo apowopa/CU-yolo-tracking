@@ -209,11 +209,23 @@ def main():
         try:
             # Definir codec de video
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec MP4
+            
+            # Determinar los FPS a usar para el video de salida
+            output_fps = 30  # FPS por defecto
+            if args.target_fps > 0:  # Si se especificó target-fps, usarlo
+                output_fps = args.target_fps / args.frame_skip
+                print(f"Usando {output_fps} FPS para el video de salida (desde target-fps)")
+            elif eff_fps > 0:  # Si no, usar los FPS del video original si están disponibles
+                output_fps = eff_fps
+                print(f"Usando {output_fps} FPS para el video de salida (desde video original)")
+            else:
+                print(f"Usando {output_fps} FPS para el video de salida (valor por defecto)")
+                
             # Crear el VideoWriter (nombre archivo, codec, fps, resolución)
             video_writer = cv2.VideoWriter(
                 args.output_video, 
                 fourcc, 
-                eff_fps if eff_fps > 0 else 30,  # Usar fps del video o 30 por defecto
+                output_fps,  # Usar los FPS determinados
                 (eff_w, eff_h)  # Misma resolución que el video original
             )
             print(f"Se guardará el video con UI en: {args.output_video}")
