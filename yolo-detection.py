@@ -138,7 +138,7 @@ def main():
     ap.add_argument("--draw-boxes", action="store_true", default=True, help="Dibujar bounding boxes (desactivar para ahorrar recursos)")
     ap.add_argument("--ground-truth", type=str, default="", help="Ruta al archivo CSV con ground truth de conteos [time,in,out]")
     ap.add_argument("--save-events", type=str, default="", help="Guardar eventos de cruce en archivo CSV [frame,track_id,event,count]")
-    ap.add_argument("--output-video", type=str, default="", help="Guardar video con UI en archivo de salida MP4 (ej: output.mp4)")
+    ap.add_argument("--output-video", type=str, default="", help="Guardar video con UI en archivo MP4 usando FFmpeg (ej: output.mp4)")
     args = ap.parse_args()
 
     print(f"Cargando modelo {args.model}...")
@@ -206,17 +206,32 @@ def main():
     # Inicializar VideoWriter si se especificó archivo de salida
     video_writer = None
     output_filename = ""  # Variable para guardar el nombre del archivo de salida
+    temp_output_file = ""  # Variable para el archivo temporal
     
     if args.output_video:
         try:
+            # Verificar que FFmpeg esté disponible en el sistema
+            import subprocess
+            import shutil
+            
+            ffmpeg_available = shutil.which('ffmpeg') is not None
+            if not ffmpeg_available:
+                print("[ADVERTENCIA] FFmpeg no está disponible en el sistema. No se podrá convertir a MP4.")
+                print("             Instala FFmpeg con: sudo apt-get install ffmpeg")
+                print("             Se guardará el video en formato AVI en su lugar.")
+            
             # Asegurar que la extensión del archivo sea .mp4
             output_filename = args.output_video
             if not output_filename.lower().endswith('.mp4'):
                 output_filename += '.mp4'
                 print(f"Añadiendo extensión .mp4 al archivo de salida: {output_filename}")
             
-            # Definir codec de video
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec MP4
+            # Crear un nombre de archivo temporal para el video intermedio
+            import os
+            temp_output_file = f"{os.path.splitext(output_filename)[0]}_temp.avi"
+            
+            # Definir codec de video para el archivo temporal (AVI)
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')  # Codec AVI que funciona bien con OpenCV
             
             # Determinar los FPS a usar para el video de salida
             output_fps = 30  # FPS por defecto
@@ -229,14 +244,15 @@ def main():
             else:
                 print(f"Usando {output_fps} FPS para el video de salida (valor por defecto)")
                 
-            # Crear el VideoWriter (nombre archivo, codec, fps, resolución)
+            # Crear el VideoWriter (nombre archivo temporal, codec, fps, resolución)
             video_writer = cv2.VideoWriter(
-                output_filename, 
+                temp_output_file, 
                 fourcc, 
                 output_fps,  # Usar los FPS determinados
                 (eff_w, eff_h)  # Misma resolución que el video original
             )
-            print(f"Se guardará el video con UI en: {output_filename}")
+            print(f"Se guardará el video con UI temporalmente en: {temp_output_file}")
+            print(f"Después se convertirá a MP4 usando FFmpeg: {output_filename}")
         except Exception as e:
             print(f"Error al inicializar VideoWriter: {e}")
             video_writer = None
@@ -672,7 +688,71 @@ def main():
     # Liberar VideoWriter si está inicializado
     if video_writer is not None:
         video_writer.release()
-        print(f"Video con UI guardado en: {output_filename}")
+        print(f"Video temporal guardado en: {temp_output_file}")
+        
+        # Verificar nuevamente si FFmpeg está disponible
+        import shutil
+        ffmpeg_available = shutil.which('ffmpeg') is not None
+        
+        if ffmpeg_available:
+            # Convertir a MP4 usando FFmpeg
+            try:
+                import subprocess
+                import os
+                
+                # Configurar el comando de FFmpeg para una conversión de alta calidad
+                ffmpeg_cmd = [
+                    'ffmpeg',
+                    '-i', temp_output_file,  # Archivo de entrada
+                    '-c:v', 'libx264',       # Codec de video H.264
+                    '-preset', 'medium',     # Preset de calidad/velocidad (slower = mejor calidad)
+                    '-crf', '23',            # Factor de calidad constante (menor = mejor calidad)
+                    '-pix_fmt', 'yuv420p',   # Formato de pixel para compatibilidad
+                    '-y',                    # Sobrescribir archivo si existe
+                    output_filename          # Archivo de salida
+                ]
+                
+                print(f"Ejecutando FFmpeg para convertir a MP4: {' '.join(ffmpeg_cmd)}")
+                
+                # Ejecutar FFmpeg
+                process = subprocess.Popen(
+                    ffmpeg_cmd, 
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                stdout, stderr = process.communicate()
+                
+                # Verificar si la conversión fue exitosa
+                if process.returncode == 0:
+                    print(f"Video con UI convertido exitosamente a MP4: {output_filename}")
+                    
+                    # Eliminar el archivo temporal
+                    try:
+                        os.remove(temp_output_file)
+                        print(f"Archivo temporal eliminado: {temp_output_file}")
+                    except Exception as e:
+                        print(f"Advertencia: No se pudo eliminar el archivo temporal: {e}")
+                else:
+                    print(f"Error al convertir video con FFmpeg: {stderr.decode()}")
+                    print(f"El video temporal sigue disponible en: {temp_output_file}")
+            except Exception as e:
+                print(f"Error al ejecutar FFmpeg: {e}")
+                print(f"El video temporal sigue disponible en: {temp_output_file}")
+        else:
+            # FFmpeg no disponible, renombrar el archivo temporal
+            try:
+                import os
+                import shutil
+                
+                # Si no hay FFmpeg, usar el archivo AVI directamente
+                if os.path.exists(output_filename):
+                    os.remove(output_filename)
+                
+                shutil.move(temp_output_file, output_filename)
+                print(f"FFmpeg no disponible. Se guardó el video en formato original: {output_filename}")
+            except Exception as e:
+                print(f"Error al renombrar archivo temporal: {e}")
+                print(f"El video temporal sigue disponible en: {temp_output_file}")
     
     if not args.headless:
         cv2.destroyAllWindows()
