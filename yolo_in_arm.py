@@ -25,7 +25,7 @@ from ultralytics import YOLO
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", type=str, required=True,
+    ap.add_argument("--model", type=str,default="yolo11n_ncnn_model", required=True,
                     help="Ruta al modelo (.pt) o carpeta NCNN (p.ej., yolo11n_ncnn_model)")
     ap.add_argument("--source", type=str, default="0",
                     help="0 para USB cam o ruta a video (MP4)")
