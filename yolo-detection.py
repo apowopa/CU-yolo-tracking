@@ -8,6 +8,158 @@ import torch
 from ultralytics import YOLO
 from evaluation import read_ground_truth, evaluate_counting
 
+# ARM/Raspberry Pi specific imports
+import platform
+import subprocess
+import os
+try:
+    import ncnn
+    NCNN_AVAILABLE = True
+except ImportError:
+    NCNN_AVAILABLE = False
+
+
+def is_raspberry_pi():
+    """Detecta si estamos ejecutando en una Raspberry Pi"""
+    try:
+        with open('/proc/cpuinfo', 'r') as f:
+            cpuinfo = f.read()
+        return 'BCM' in cpuinfo or 'Raspberry' in cpuinfo
+    except:
+        return False
+
+
+def get_cpu_temperature():
+    """Obtiene la temperatura del CPU en Raspberry Pi"""
+    try:
+        with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+            temp = int(f.read()) / 1000.0
+        return temp
+    except:
+        return None
+
+
+def check_ncnn_installation():
+    """Verifica si NCNN está instalado y disponible"""
+    if not NCNN_AVAILABLE:
+        print("[INFO] NCNN no está disponible. Instalando...")
+        print("       Para instalar NCNN en Raspberry Pi:")
+        print("       pip install ncnn")
+        print("       o compilar desde fuente para mejor rendimiento")
+        return False
+    return True
+
+
+def optimize_for_arm():
+    """Configuraciones específicas para ARM/Raspberry Pi"""
+    # Configurar OpenCV para usar threads optimizados para ARM
+    cv2.setNumThreads(2)  # Usar 2 threads en lugar del default
+    
+    # Configurar para usar NEON si está disponible
+    if hasattr(cv2, 'setUseOptimized'):
+        cv2.setUseOptimized(True)
+
+
+class NCNNYolo:
+    """Wrapper para YOLO usando NCNN optimizado para ARM"""
+    
+    def __init__(self, param_path, bin_path, input_size=320, conf_threshold=0.5):
+        if not NCNN_AVAILABLE:
+            raise ImportError("NCNN no está disponible")
+            
+        self.net = ncnn.Net()
+        self.net.opt.use_vulkan_compute = False  # Desactivar Vulkan en ARM
+        self.net.opt.num_threads = 2  # Optimizado para Raspberry Pi
+        
+        # Cargar modelo NCNN
+        self.net.load_param(param_path)
+        self.net.load_model(bin_path)
+        
+        self.input_size = input_size
+        self.conf_threshold = conf_threshold
+        self.class_names = ['person']  # Solo persona para este caso
+        
+    def preprocess(self, image):
+        """Preprocesar imagen para NCNN"""
+        # Redimensionar manteniendo aspecto
+        h, w = image.shape[:2]
+        scale = min(self.input_size / w, self.input_size / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        
+        resized = cv2.resize(image, (new_w, new_h))
+        
+        # Padding para hacer cuadrado
+        pad_w = self.input_size - new_w
+        pad_h = self.input_size - new_h
+        top, bottom = pad_h // 2, pad_h - pad_h // 2
+        left, right = pad_w // 2, pad_w - pad_w // 2
+        
+        padded = cv2.copyMakeBorder(resized, top, bottom, left, right, 
+                                   cv2.BORDER_CONSTANT, value=(114, 114, 114))
+        
+        # Normalizar y convertir a mat de NCNN
+        mat_in = ncnn.Mat.from_pixels(padded, ncnn.Mat.PixelType.PIXEL_BGR, 
+                                     self.input_size, self.input_size)
+        mat_in.substract_mean_normalize([0, 0, 0], [1/255.0, 1/255.0, 1/255.0])
+        
+        return mat_in, scale, (left, top)
+        
+    def postprocess(self, output, scale, offset, img_shape):
+        """Posprocesar salidas de NCNN"""
+        detections = []
+        
+        # Procesar salidas del modelo (esto depende del formato específico del modelo NCNN)
+        # Aquí asumo formato similar a YOLOv8
+        for i in range(output.h):
+            detection = output.row(i)
+            
+            # Extraer coordenadas y confianza
+            x_center = detection[0]
+            y_center = detection[1] 
+            width = detection[2]
+            height = detection[3]
+            confidence = detection[4]
+            
+            if confidence > self.conf_threshold:
+                # Convertir de formato centro a esquinas
+                x1 = (x_center - width/2 - offset[0]) / scale
+                y1 = (y_center - height/2 - offset[1]) / scale
+                x2 = (x_center + width/2 - offset[0]) / scale
+                y2 = (y_center + height/2 - offset[1]) / scale
+                
+                # Recortar a límites de imagen
+                x1 = max(0, min(img_shape[1], x1))
+                y1 = max(0, min(img_shape[0], y1))
+                x2 = max(0, min(img_shape[1], x2))
+                y2 = max(0, min(img_shape[0], y2))
+                
+                detections.append([x1, y1, x2, y2, confidence])
+                
+        return np.array(detections) if detections else np.empty((0, 5))
+        
+    def detect(self, image):
+        """Detectar objetos en imagen usando NCNN"""
+        try:
+            # Preprocesar
+            mat_in, scale, offset = self.preprocess(image)
+            
+            # Inferencia
+            ex = self.net.create_extractor()
+            ex.input("images", mat_in)  # Nombre de entrada del modelo
+            ret, mat_out = ex.extract("output")  # Nombre de salida del modelo
+            
+            if ret != 0:
+                return np.empty((0, 5))
+                
+            # Posprocesar
+            detections = self.postprocess(mat_out, scale, offset, image.shape)
+            
+            return detections
+            
+        except Exception as e:
+            print(f"Error en detección NCNN: {e}")
+            return np.empty((0, 5))
+
 
 def sign_of_line(A, B, P):
     """Determina de qué lado de una línea se encuentra un punto.
